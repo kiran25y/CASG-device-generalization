@@ -123,19 +123,7 @@ configuration freeze (2026-09-07T02:37:24Z), together with the statement that no
 hyperparameter, checkpoint-selection rule or analysis variant may be selected
 using frozen-test results after that timestamp.
 
-## Citation
 
-Manuscript under review. Please cite this repository until a DOI is available.
-
-```bibtex
-@misc{casg2026,
-  author = {Yerpude, Kiran and Jeong, Seunggyu and Kim, Seong-Eun},
-  title  = {CASG: Continuous Acquisition-Style Generalization for
-            Cross-Device Respiratory Sound Classification},
-  year   = {2026},
-  url    = {https://github.com/kiran25y/CASG-device-generalization}
-}
-```
 
 ## Licence
 
