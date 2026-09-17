@@ -1,0 +1,192 @@
+experiment:
+  mode: dev
+  allow_outer_eval: false
+  allow_external: false
+
+# PRIMARY candidate (v3): physics + CF + random same-class cross-patient residual swap. No style encoder/queue.
+# CASG-Net — Continuous Acquisition-Style Generalization (protocol v2.0)
+#
+# Paths are UNCHANGED from the version on the SSH box. Everything new is
+# additive (audio.ssp, model.ast_*, optim.select_metric, data.cache_max_clips).
+seed: 0
+device: auto
+output_dir: runs
+
+data:
+  data_root: data_real
+  train_manifest: data_real/train_manifest.csv    # Seoul hospital (in-domain anchor)
+  icbhi_manifest: data_real/icbhi_manifest.csv     # ICBHI per-cycle (4 devices)
+  extra_manifest: data_real/extra_manifest.csv   # iPhone only (held-out smartphone)
+  test_manifest: data_real/test_manifest.csv       # Sungbook external (frozen Tier-3)
+  icbhi_devices: [Meditron, AKGC417L, LittC2SE, Litt3200]
+  loo_devices:   [Meditron, AKGC417L, LittC2SE, Litt3200, smartphone]
+  patient_exclusion: true
+  # protocol v2 4.6: Hospital B is frozen in EVERY modality. These
+  # source tags are removed from the development pool (training,
+  # validation, style queue) and are evaluated only as external arms.
+  dev_exclude_sources: [sungbook_iphone, sungbook_steth, sungbook]
+  external_phone_manifest: data_real/extra_manifest.csv
+
+  drop_tier3_patient: "sungbook_50118"
+  internal_val_frac: 0.15
+  num_workers: 8
+  cache_max_clips: 6000          # bounded waveform cache (per worker)
+
+audio:
+  sample_rate: 16000             # model rate (keeps AST's 25ms/10ms contract)
+  n_mels: 128                    # must stay 128 for the AST backbone
+  n_fft: 1024
+  hop_length: 160                # 10 ms
+  win_length: 400                # 25 ms
+  fmin: 20
+  fmax: 2000                     # fallback only; SSP overrides with ssp.cutoff_hz
+  clip_seconds: 4.0              # was 8.0 -> 62-73% of the window was zero padding
+  pad_mode: repeat               # was implicit zero-pad (a device fingerprint)
+  pcen: false
+  # ---- SSP: signal-level band harmonisation (see src/data/ssp.py) ---------
+  # Native rates in our manifests are 4k (Seoul/Sungbook/Litt3200),
+  # 44.1k (AKGC417L/LittC2SE), 48k (iPhone) -> sample rate was an almost perfect
+  # device label. SSP low-passes everything to a common band before the mel.
+  # cutoff_hz is the one genuinely open design choice: sweep it with
+  # scripts/sweep_preproc.py rather than inheriting 1000 from the prior work.
+  ssp:
+    enabled: true
+    cutoff_hz: 2000              # sweep {1000, 2000}; must be <= work_sr/2
+    work_sr: 4000                # common decimation rate
+    order: 8                     # zero-phase Butterworth
+
+augment:
+  enabled: true
+  spec_augment: true
+  spec_freq_mask: 24
+  spec_time_mask: 48
+  spec_n_masks: 2
+  # Frequency ranges below are written against a nominal 8 kHz design band and
+  # are rescaled to the actual SSP band by DeviceSimulator — otherwise a
+  # 1.5-7.5 kHz low-pass sweep is a no-op at a 2 kHz ceiling.
+  device_sim:
+    gain:     {p: 0.5, min_db: -8.0, max_db: 8.0}
+    eq:       {p: 0.6, n_bands: 3, gain_db: 9.0, f_min: 100, f_max: 6000, q_min: 0.5, q_max: 2.5}
+    lowpass:  {p: 0.4, cutoff_min: 1500, cutoff_max: 7500}
+    highpass: {p: 0.4, cutoff_min: 20,   cutoff_max: 300}
+    tilt:     {p: 0.3, alpha_min: -0.97, alpha_max: 0.97}
+    codec:    {p: 0.3, bits_min: 6,  bits_max: 14}
+    noise:    {p: 0.5, snr_min: 5.0, snr_max: 30.0}
+  extreme:
+    enabled: true
+    p: 0.15
+    scale: 2.5
+
+model:
+  variant: casg_lite
+  method: casg                   # ACPL-v1 (see src/models/acpl.py)
+  acq_dim: 64                    # acquisition-state dimensionality q
+  acpl_clean_anchor: false       # true = literal KL[sg(p(y|x))||p(y|A(x))], +1 fwd pass
+  backbone: ast                  # ast | timm | cnn
+  ast_name: MIT/ast-finetuned-audioset-10-10-0.4593   # AudioSet-pretrained
+  ast_input_scale: 0.5           # match AST's expected feature scale
+  ast_grad_checkpoint: false     # set true if OOM
+  timm_name: efficientnet_b0     # used only when backbone: timm
+  timm_pretrained: true
+  feat_dim: 256
+  n_classes4: 4
+  n_classes2: 2
+  dropout: 0.2
+  mixstyle: false                # ON only for methods 'mixstyle'/'dmixstyle',
+                                 # so 'erm' is a real control
+  mixstyle_p: 0.5
+  mixstyle_alpha: 0.5
+  style_dim: 128
+  proj_dim: 128
+
+loss:
+  acpl_lambda_acq: 0.5           # L_acq weight; 0 -> ACPL-B ablation
+  acpl_lambda_cf: 1.0            # L_CF weight;  0 -> ACPL-A ablation
+  focal_gamma: 2.0
+  w_logits4: 0.7
+  w_logits2: 0.3
+  logit_adjust: false
+  logit_adjust_tau: 1.0
+  supcon_weight: 0.5
+  supcon_tau: 0.1
+  coral_weight: 1.0
+  coral_min_per_domain: 4        # skip devices with too few samples in a batch
+
+optim:
+  # Budget: measured 4.8 it/s at bs16 on AST => 6.25 min/epoch on the AKGC417L
+  # fold. epochs 50 x 5 seeds x 2 grids was ~41 GPU-days, which is not runnable.
+  # 30/7/32 keeps ~115 runs inside a week. Confirm 30 is enough from the
+  # sweep's convergence curves before trusting it.
+  epochs: 30
+  batch_size: 32                 # ~1.5x throughput vs 16; also helps CORAL,
+                                 # which needs >=2 devices present per batch
+  lr: 8.0e-5                     # scaled with the larger batch (was 5e-5 @ bs16)
+  weight_decay: 1.0e-6
+  warmup_epochs: 3
+  grad_clip: 5.0
+  amp: true
+  sampler: device_class
+  dann_lambda_max: 1.0
+  early_stop_patience: 7
+  select_metric: auroc2          # threshold-free model selection
+
+eval:
+  # 3 seeds x 5 held-out devices = 15 paired observations per method for the
+  # bootstrap. Add seeds 3,4 for the headline pair only if a reviewer asks.
+  seeds: [0, 1, 2]
+
+# ---------------------------------------------------------------------
+# Raw source CSVs for scripts/build_manifests.py (edit to your machine).
+# Seoul train_manifest = TRAINING anchor. Sungbook test_manifest = FROZEN
+# external test (different hospital, never trained on).
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# CASG (protocol v2.0). The physics simulator, style branch, queue and
+# token-style transfer are TRAINING ONLY; inference is a plain AST pass.
+# Do not tune these on outer LODO or the frozen external hospital.
+# ---------------------------------------------------------------------
+casg:
+  split_block: 9
+  style_taps: [3, 6, 9]
+  style_dim: 128
+  pathology_dim: 256
+  style_queue_per_class: 256
+  residual_style_strength: 0.50
+  lambda_cf: 1.0
+  lambda_style: 0.10
+  lambda_cspc: 0.20
+  style_temperature: 0.07
+  curriculum:
+    style_warmup_end: 5
+    random_swap_start: 6
+    far_style_start: 13
+    virtual_style_start: 21
+  # physics simulator (section 6); ranges are source-validation choices
+  probs: {resp: 0.80, lp: 0.40, hp: 0.40, noise: 0.45,
+          hum: 0.15, comp: 0.15, clip: 0.05, quant: 0.10}
+  resp_ctrl_points: 8
+  resp_max_db: 8.0
+  snr_db: [15.0, 40.0]
+  snr_hard_db: [8.0, 15.0]
+  p_snr_hard: 0.10
+  delta_style: 1.0
+  far_tries: 8
+
+sources:
+  # Seoul stethoscope hospital = TRAINING anchor
+  hospital_csv: /workspace/lungsound/train_manifest.csv
+  hospital_dir: /workspace/lungsound/hospital_dataset/audio_data
+  # ICBHI per-cycle (4 contact stethoscopes) = training
+  icbhi_csv:    /workspace/dataset/ICBHI_final_database/label/labels.per_cycle.csv
+  icbhi_dir:    /workspace/dataset/ICBHI_final_database
+  # Sungbook stethoscope hospital = FROZEN external test
+  sungbook_csv: /workspace/lungsound/test_manifest.csv
+  sungbook_dir: /workspace/lungsound/stethoscope_dataset_sungbook
+  # iPhone (Seoul + Sungbook) = device 'smartphone' = HELD-OUT unseen device (headline)
+  iphone_seoul_dir:    /workspace/lungsound/smartphone/iphone_dataset_seoul
+  iphone_sungbook_dir: /workspace/lungsound/smartphone/iphone_dataset_sungbook
+# NOTE: SPRSound and HF-Lung are deliberately NOT used. Scope is two cohorts —
+# the hospital data (Seoul + Sungbook stethoscopes + iPhone) and ICBHI (4
+# stethoscopes) — giving 7 capture devices and 5 leave-one-device-out folds.
+# SPRSound carried label4 = -1 (binary only, pediatric, different population),
+# so it added no 4-class signal and confounded the device comparison.

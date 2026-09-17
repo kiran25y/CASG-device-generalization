@@ -1,0 +1,12 @@
+torch>=2.1
+torchaudio>=2.1
+timm>=0.9
+transformers>=4.35          # AST (AudioSet-pretrained) backbone
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+scipy>=1.10                 # SSP: Butterworth design + zero-phase filtering
+soundfile>=0.12
+PyYAML>=6.0
+tqdm>=4.65
+matplotlib>=3.7             # ROC/PR, KDE and t-SNE figures (report.py --curves)
